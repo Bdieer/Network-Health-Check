@@ -1,0 +1,448 @@
+PowerShell -ExecutionPolicy Bypass -Command {
+
+$reportPath = "$env:USERPROFILE\Desktop\Internet_Report_$(Get-Date -Format 'yyyy-MM-dd_HH-mm').txt"
+$results = @()
+
+function WR($label, $value, $status) {
+
+    $color = if ($status -eq "OK") {
+        "Green"
+    }
+    elseif ($status -eq "WARN") {
+        "Yellow"
+    }
+    else {
+        "Red"
+    }
+
+    $icon = if ($status -eq "OK") {
+        "[ OK ]"
+    }
+    elseif ($status -eq "WARN") {
+        "[ !! ]"
+    }
+    else {
+        "[ XX ]"
+    }
+
+    Write-Host "$icon  $label : $value" -ForegroundColor $color
+
+    $script:results += "$icon  $label : $value"
+}
+
+function WS($title) {
+
+    $line = "=" * 60
+
+    Write-Host "`n$line" -ForegroundColor Cyan
+    Write-Host "  $title" -ForegroundColor Yellow
+    Write-Host "$line" -ForegroundColor Cyan
+
+    $script:results += "`n$line`n  $title`n$line"
+}
+
+# ============================================================
+# 1. NETWORK ADAPTER
+# ============================================================
+
+WS "1. Network Adapter"
+
+$adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+
+if ($adapters) {
+
+    foreach ($a in $adapters) {
+
+        WR "Adapter" "$($a.Name) | $($a.InterfaceDescription)" "OK"
+        WR "Speed" $a.LinkSpeed "OK"
+        WR "MAC" $a.MacAddress "OK"
+    }
+}
+else {
+
+    WR "Adapter" "No active adapter found!" "FAIL"
+}
+
+# ============================================================
+# 2. IP CONFIGURATION
+# ============================================================
+
+WS "2. IP Configuration"
+
+$ipConfig = Get-NetIPConfiguration |
+    Where-Object { $_.IPv4DefaultGateway -ne $null }
+
+if ($ipConfig) {
+
+    foreach ($cfg in $ipConfig) {
+
+        WR "Local IP" $cfg.IPv4Address.IPAddress "OK"
+        WR "Gateway" $cfg.IPv4DefaultGateway.NextHop "OK"
+        WR "DNS" ($cfg.DnsServer.ServerAddresses -join ", ") "OK"
+    }
+}
+else {
+
+    WR "IP Config" "No gateway found" "FAIL"
+}
+
+# ============================================================
+# 3. PUBLIC IP
+# ============================================================
+
+WS "3. Public IP"
+
+try {
+
+    $pub = (
+        Invoke-RestMethod `
+            -Uri "https://api.ipify.org?format=json" `
+            -TimeoutSec 5
+    ).ip
+
+    WR "Public IP" $pub "OK"
+}
+catch {
+
+    WR "Public IP" "Failed to retrieve" "FAIL"
+}
+
+# ============================================================
+# 4. PING TESTS
+# ============================================================
+
+WS "4. Ping Tests"
+
+$gateway = (
+    Get-NetIPConfiguration |
+    Where-Object { $_.IPv4DefaultGateway -ne $null } |
+    Select-Object -First 1
+).IPv4DefaultGateway.NextHop
+
+$pingTargets = @(
+    @{ Name = "Local Gateway";         Target = $gateway },
+    @{ Name = "Google DNS (8.8.8.8)"; Target = "8.8.8.8" },
+    @{ Name = "Cloudflare (1.1.1.1)"; Target = "1.1.1.1" },
+    @{ Name = "Google.com";           Target = "google.com" }
+)
+
+foreach ($p in $pingTargets) {
+
+    try {
+
+        $r = Test-Connection `
+            -ComputerName $p.Target `
+            -Count 2 `
+            -ErrorAction Stop
+
+        $avg = [math]::Round(
+            (
+                ($r | Measure-Object -Property ResponseTime -Average).Average
+            ),
+            2
+        )
+
+        $status = if ($avg -lt 50) {
+            "OK"
+        }
+        elseif ($avg -lt 150) {
+            "WARN"
+        }
+        else {
+            "FAIL"
+        }
+
+        WR $p.Name "$avg ms" $status
+    }
+    catch {
+
+        WR $p.Name "No response" "FAIL"
+    }
+}
+
+# ============================================================
+# 5. DNS TESTS
+# ============================================================
+
+WS "5. DNS Tests"
+
+@(
+    "google.com",
+    "youtube.com",
+    "microsoft.com",
+    "cloudflare.com"
+) | ForEach-Object {
+
+    try {
+
+        $r = Resolve-DnsName $_ -ErrorAction Stop |
+            Where-Object { $_.Type -eq "A" } |
+            Select-Object -First 1
+
+        WR "DNS: $_" $r.IPAddress "OK"
+    }
+    catch {
+
+        WR "DNS: $_" "Failed" "FAIL"
+    }
+}
+
+# ============================================================
+# 6. DOWNLOAD SPEED
+# ============================================================
+
+WS "6. Download Speed (Approximate)"
+
+try {
+
+    $url = "https://speed.cloudflare.com/__down?bytes=1000000"
+
+    $s = Get-Date
+
+    $null = (Invoke-WebRequest `
+        -Uri $url `
+        -TimeoutSec 15).Content
+
+    $e = ((Get-Date) - $s).TotalSeconds
+
+    $spd = [math]::Round(
+        ((1MB / $e) * 8) / 1MB,
+        2
+    )
+
+    if ($spd -lt 10) {
+
+        $quality = "Poor"
+        $st = "FAIL"
+    }
+    elseif ($spd -lt 50) {
+
+        $quality = "Good"
+        $st = "WARN"
+    }
+    elseif ($spd -lt 100) {
+
+        $quality = "Very Good"
+        $st = "OK"
+    }
+    elseif ($spd -lt 450) {
+
+        $quality = "Excellent"
+        $st = "OK"
+    }
+    else {
+
+        $quality = "Super Good"
+        $st = "OK"
+    }
+
+    WR "Download Speed" "${spd} Mbps [$quality]" $st
+}
+catch {
+
+    WR "Download Speed" "Test failed: $($_.Exception.Message)" "WARN"
+}
+
+# ============================================================
+# 7. FIREWALL STATUS
+# ============================================================
+
+WS "7. Firewall Status"
+
+Get-NetFirewallProfile | ForEach-Object {
+
+    $st = if ($_.Enabled) {
+        "OK"
+    }
+    else {
+        "WARN"
+    }
+
+    WR "Firewall [$($_.Name)]" `
+        $(if ($_.Enabled) { "Enabled" } else { "Disabled" }) `
+        $st
+}
+
+# ============================================================
+# 8. NETWORK SERVICES
+# ============================================================
+
+WS "8. Network Services"
+
+@(
+    @("DHCP Client", "Dhcp"),
+    @("DNS Client", "Dnscache"),
+    @("WLAN AutoConfig", "WlanSvc"),
+    @("Windows Update", "wuauserv")
+) | ForEach-Object {
+
+    $svc = Get-Service `
+        -Name $_[1] `
+        -ErrorAction SilentlyContinue
+
+    if ($svc) {
+
+        $st = if ($svc.Status -eq "Running") {
+            "OK"
+        }
+        else {
+            "WARN"
+        }
+
+        WR $_[0] $svc.Status $st
+    }
+    else {
+
+        WR $_[0] "Not found" "OK"
+    }
+}
+
+# ============================================================
+# 9. HOSTS FILE
+# ============================================================
+
+WS "9. Hosts File"
+
+$h = Get-Content `
+    "$env:SystemRoot\System32\drivers\etc\hosts" |
+    Where-Object {
+        $_ -notmatch "^#" -and $_.Trim() -ne ""
+    }
+
+if ($h.Count -gt 0) {
+
+    WR "Custom Entries" `
+        "$($h.Count) found (may cause issues)" `
+        "WARN"
+
+    $h | ForEach-Object {
+
+        WR "  Entry" $_ "WARN"
+    }
+}
+else {
+
+    WR "Hosts File" "Clean" "OK"
+}
+
+# ============================================================
+# 10. PROXY SETTINGS
+# ============================================================
+
+WS "10. Proxy Settings"
+
+$px = Get-ItemProperty `
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" `
+    -ErrorAction SilentlyContinue
+
+if ($px.ProxyEnable -eq 1) {
+
+    WR "Proxy" "ENABLED: $($px.ProxyServer)" "WARN"
+}
+else {
+
+    WR "Proxy" "Disabled (normal)" "OK"
+}
+
+# ============================================================
+# 11. ADAPTER STATISTICS
+# ============================================================
+
+WS "11. Adapter Statistics"
+
+Get-NetAdapterStatistics |
+    Where-Object { $_.Name -in $adapters.Name } |
+    ForEach-Object {
+
+        WR "$($_.Name) Received" `
+            "$([math]::Round($_.ReceivedBytes / 1MB, 2)) MB" `
+            "OK"
+
+        WR "$($_.Name) Sent" `
+            "$([math]::Round($_.SentBytes / 1MB, 2)) MB" `
+            "OK"
+
+        $d = $_.ReceivedDiscardedPackets + $_.OutboundDiscardedPackets
+
+        WR "$($_.Name) Discarded" `
+            $d `
+            $(if ($d -gt 100) { "WARN" } else { "OK" })
+    }
+
+# ============================================================
+# 12. TRACEROUTE
+# ============================================================
+
+WS "12. Traceroute to Google (8 hops)"
+
+WS "12. Connectivity + Route Test"
+
+# --- TCP connectivity (real indicator) ---
+try {
+
+    $tcp = Test-NetConnection -ComputerName "google.com" -Port 443 -WarningAction SilentlyContinue
+
+    if ($tcp.TcpTestSucceeded) {
+        WR "TCP to Google (443)" "Success" "OK"
+    }
+    else {
+        WR "TCP to Google (443)" "Failed" "FAIL"
+    }
+
+}
+catch {
+    WR "TCP to Google (443)" "Failed" "FAIL"
+}
+
+# --- Route trace (ICMP-based, optional visibility only) ---
+try {
+
+    $route = tracert google.com 2>$null
+
+    if ($route) {
+
+        $i = 1
+
+        $route | ForEach-Object {
+
+            if ($_ -match "\d+\s+ms" -or $_ -match "\*") {
+                WR "Hop $i" $_ "OK"
+                $i++
+            }
+        }
+
+    }
+    else {
+        WR "Route Trace" "Unavailable" "WARN"
+    }
+
+}
+catch {
+    WR "Route Trace" "Failed" "WARN"
+}
+
+# ============================================================
+# SAVE REPORT
+# ============================================================
+
+$header =
+    "=" * 60 +
+    "`nInternet Diagnostic Report" +
+    "`nDate: $(Get-Date)" +
+    "`nMachine: $env:COMPUTERNAME" +
+    "`nUser: $env:USERNAME`n" +
+    "=" * 60
+
+(
+    $header +
+    "`n" +
+    ($results -join "`n")
+) | Out-File `
+        -FilePath $reportPath `
+        -Encoding UTF8
+
+Write-Host "`n[ DONE ] Report saved to: $reportPath" `
+    -ForegroundColor Green
+
+Read-Host "Press Enter to exit"
+}
